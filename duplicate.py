@@ -1,104 +1,117 @@
 import os
-import numpy as np
-import time
-import itertools
-from PIL import Image
-from tqdm import tqdm
+import shutil
 import argparse
-import pdb
-from scipy.spatial import distance
-
-parser = argparse.ArgumentParser(description='find-duplicate-images')
-parser.add_argument('--inspection_folder', type=str, default="D:\\Pictures\\Inspection", help='Directory of images.')
-args = parser.parse_args()
-
-inspection_folder = args.inspection_folder
-print ("Inspection folder: " + str(inspection_folder))
-
-folders = [x[0] for x in os.walk(inspection_folder)]
+from PIL import Image
+import numpy as np
+from tqdm import tqdm
+import hashlib
+from scipy.spatial.distance import hamming
+from concurrent.futures import ThreadPoolExecutor
 
 COMPARE_SIZE = 300
+DUPLICATE_FOLDER_NAME = "_duplicates"
 
-to_delete = []
+try:
+    resampling = Image.Resampling.LANCZOS  # For Pillow >= 9.1.0
+except AttributeError:
+    resampling = Image.LANCZOS  # For older Pillow versions
 
-def check_folder(folder):
-	print("Checking Folder -> " + folder)
-	files = os.listdir(folder)
-	files.sort()
-	m = len(files)
+def image_hash(img_path):
+    """Generate perceptual hash for an image."""
+    img = Image.open(img_path).convert("L").resize((COMPARE_SIZE, COMPARE_SIZE), resampling)
+    pixels = np.array(img).flatten()
+    avg = pixels.mean()
+    return "".join("1" if p > avg else "0" for p in pixels)
 
-	images = []
-	images_name = []
-	time.sleep(1)
-	for i in tqdm(range(m)):
-		try:
-			img = Image.open(os.path.join(folder, files[i])).convert('RGB')
-			if img is not None:
-				img = img.resize((COMPARE_SIZE, COMPARE_SIZE))
-				img = np.array(img)[:,:,0]
-				
-				images.append(img)
-				images_name.append(files[i])
-		except:
-			pass
-	time.sleep(1)
+def get_similarity_score(hash1, hash2):
+    """Calculate similarity score between two hashes."""
+    dist = hamming(list(hash1), list(hash2))
+    return round((1 - dist) * 100, 2)  # Similarity as a percentage
 
-	images = np.array(images)
-	m = images.shape[0]
-	print("Images Read. Total images = " + str(m))
+def sha256_hash(file_path):
+    """Generate SHA256 hash for a file."""
+    sha256 = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            sha256.update(chunk)
+    return sha256.hexdigest()
 
-	if m == 0:
-		print()
-		return
-	
-	print("Finding duplicates now...")
-	im_duplicates = []
-	for i in tqdm(range(m)):
-		duplicates = np.all(images==images[i], axis=(1,2))
-		duplicates[i] = False
-		idx = np.where(duplicates)[0]
-		if idx.size > 0:
-			im_duplicate = list()
-			im_duplicate.append(i)
-			for j in range(idx.shape[0]):
-				im_duplicate.append(idx[j])
-			im_duplicate.sort()
-			im_duplicates.append(im_duplicate)
-	time.sleep(1)
-	# pdb.set_trace()
-	im_duplicates.sort()
-	im_duplicates = list(im_duplicates for im_duplicates, _ in itertools.groupby(im_duplicates))
+def process_images(input_folder):
+    """Find and move duplicate images, keeping the one in the deepest subfolder."""
+    encountered_hashes = {}
+    duplicates_folder = os.path.join(input_folder, DUPLICATE_FOLDER_NAME)
+    os.makedirs(duplicates_folder, exist_ok=True)
 
-	if len(im_duplicates) > 0:
-		print()
-		print("Duplicates:")
-		for i in range(len(im_duplicates)):
-			for j in range(len(im_duplicates[i])):
-				print(images_name[im_duplicates[i][j]], end="\t")
-				if j>0:
-					to_delete.append(os.path.join(folder, images_name[im_duplicates[i][j]]))
-			print()
-	else:
-		print("No duplicates found.")
-	print()
+    print("\nProcessing Images...")
+    for root, _, files in os.walk(input_folder):
+        for file in tqdm(files, desc="Scanning images"):
+            if not file.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp')):
+                continue
+            
+            file_path = os.path.join(root, file)
+            try:
+                img_hash = image_hash(file_path)
+                if img_hash in encountered_hashes:
+                    existing_file = encountered_hashes[img_hash]
 
-for folder in folders:
-	check_folder(folder)
+                    # Compare folder depth and keep the one in the subfolder
+                    if file_path.count(os.sep) > existing_file.count(os.sep):
+                        # Move the file in the parent folder to _duplicates
+                        print(f"Moving duplicate (parent folder): {existing_file}")
+                        shutil.move(existing_file, os.path.join(duplicates_folder, os.path.basename(existing_file)))
+                        encountered_hashes[img_hash] = file_path  # Update to the deeper file
+                    else:
+                        print(f"Moving duplicate (subfolder): {file_path}")
+                        shutil.move(file_path, os.path.join(duplicates_folder, os.path.basename(file_path)))
+                else:
+                    encountered_hashes[img_hash] = file_path
+            except Exception as e:
+                print(f"Error processing image {file_path}: {e}")
 
-print('-----------------------------Overall Report----------------------------------')
+def process_videos(input_folder):
+    """Find and move duplicate videos, keeping the one in the deepest subfolder."""
+    encountered_hashes = {}
+    duplicates_folder = os.path.join(input_folder, DUPLICATE_FOLDER_NAME)
+    os.makedirs(duplicates_folder, exist_ok=True)
 
-if len(to_delete) == 0:
-	print("No duplicates found.")
-	exit()
+    print("\nProcessing Videos...")
+    for root, _, files in os.walk(input_folder):
+        for file in tqdm(files, desc="Scanning videos"):
+            if not file.lower().endswith(('.mp4', '.avi', '.mkv', '.mov', '.wmv')):
+                continue
+            
+            file_path = os.path.join(root, file)
+            try:
+                file_hash = sha256_hash(file_path)
+                file_size = os.path.getsize(file_path)
+                
+                if file_hash in encountered_hashes:
+                    existing_file, existing_size = encountered_hashes[file_hash]
 
-print("\nFiles marked for delete:")
-for file in to_delete:
-	print(file)
-print("Type Y to delete")
-inp = input()
-if inp.lower() == 'y':
-	for file in to_delete:
-		os.remove(file)
-	print("Done.")
-else:
-	print("Files not deleted.")
+                    # Compare folder depth and keep the one in the subfolder
+                    if file_path.count(os.sep) > existing_file.count(os.sep):
+                        print(f"Moving duplicate (parent folder): {existing_file}")
+                        shutil.move(existing_file, os.path.join(duplicates_folder, os.path.basename(existing_file)))
+                        encountered_hashes[file_hash] = (file_path, file_size)
+                    else:
+                        print(f"Moving duplicate (subfolder): {file_path}")
+                        shutil.move(file_path, os.path.join(duplicates_folder, os.path.basename(file_path)))
+                else:
+                    encountered_hashes[file_hash] = (file_path, file_size)
+            except Exception as e:
+                print(f"Error processing video {file_path}: {e}")
+
+def main():
+    parser = argparse.ArgumentParser(description='Duplicate Image and Video Finder')
+    parser.add_argument('--inspection_folder', type=str, required=True, help='Directory to inspect for duplicates')
+    args = parser.parse_args()
+    
+    input_folder = args.inspection_folder
+    print(f"Inspection folder: {input_folder}")
+    
+    process_images(input_folder)
+    process_videos(input_folder)
+    print("\nProcessing complete. Duplicates have been moved to the '_duplicates' folder.")
+
+if __name__ == "__main__":
+    main()
